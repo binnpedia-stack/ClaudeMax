@@ -850,6 +850,14 @@ local tabs = {
 				note("Instant: langsung kena zona"),
 				note("Random: Instant, pindah ke Normal saat King's Scourge"),
 			}),
+			card("Auto Parry", {
+				toggle("Auto Parry", true),
+				toggle("Silent Parry", true),
+				toggle("Visual Radius", true),
+				toggle("Abyss Auto Crouch", true),
+				slider("Parry Radius", 1, 60, 15),
+				slider("Facing Dot", -1, 1, 0.5, 0.05),
+			}),
 			card("Survivor Ability", {
 				toggle("God Mode (Anti Knock)"), toggle("Dodge Slash Abyss"), toggle("Unlimited Vault"),
 				toggle("Fast Vault (Anti Slow)"), toggle("No CD Flowstate"), toggle("No Fall Damage"),
@@ -2120,6 +2128,672 @@ local function setupSkillCheck()
 end
 
 setupSkillCheck()
+
+-- AUTO PARRY. Your logic, connected to the Survivor tab.
+local function setupAutoParry()
+	local runService = game:GetService("RunService")
+	local replicatedStorage = game:GetService("ReplicatedStorage")
+	local collectionService = game:GetService("CollectionService")
+
+	-- Abysswalker Slash is not parried, it triggers the crouch instead.
+	local ABYSS_SLASH_ID = "100014992013740"
+	local MAX_VISUAL_RADIUS = 1024
+	local RING_NAME = "BintangParryRing"
+
+	-- Lunge animations that must be parried.
+	local LUNGE_IDS = {
+		["127417297154354"] = true, ["129626174716003"] = true, ["135002183282873"] = true,
+		["105374834496520"] = true, ["117042998468241"] = true, ["93902163029544"] = true,
+		["104540716539347"] = true, ["113255068724446"] = true, ["98163597193511"] = true,
+		["125430111937587"] = true, ["84926129581106"] = true,
+		["138720291317243"] = true, ["115244153053858"] = true,
+	}
+
+	-- Animations and parts that never count as a wall.
+	local NON_WALL_NAMES = {
+		hitbox = true, hitboxes = true, weapon = true, weaponhitbox = true, stunshove = true,
+		rushvfx = true, vfxdebris = true, vfx = true, effect = true, effects = true, fx = true,
+	}
+
+	local serverCooldownEnd = 0
+	local isCrouchSequenceActive = false
+	local lastTriggerAt = 0
+	local cachedButton = nil
+	local currentKiller, killerHookConnection, hookedAnimator = nil, nil, nil
+	local activeTrackerToken = 0
+	local ringPart, ringGui
+
+	local oldRing = workspace:FindFirstChild(RING_NAME)
+	if oldRing then
+		pcall(function()
+			oldRing:Destroy()
+		end)
+	end
+
+	-- Listen for the cooldown the server sends after a parry.
+	task.spawn(function()
+		pcall(function()
+			local remotes = replicatedStorage:WaitForChild("Remotes", 5)
+			local items = remotes and remotes:WaitForChild("Items", 5)
+			local dagger = items and items:WaitForChild("Parrying Dagger", 5)
+			local result = dagger and dagger:WaitForChild("parryResult", 5)
+
+			if result then
+				table.insert(connections, result.OnClientEvent:Connect(function(_, cooldown)
+					if typeof(cooldown) == "number" and cooldown > 0 then
+						serverCooldownEnd = tick() + cooldown
+					end
+				end))
+			end
+		end)
+	end)
+
+	-- Silent Parry: clear the states that would block a parry.
+	local function bypassAllStates()
+		local character = localPlayer.Character
+		if not flags["Survivor.Silent Parry"] or not character then
+			return
+		end
+
+		local root = character:FindFirstChild("HumanoidRootPart")
+		local check = character:FindFirstChild("CheckInterractable")
+
+		if root then
+			pcall(function()
+				collectionService:RemoveTag(root, "doing action")
+			end)
+		end
+
+		if check then
+			for _, attribute in ipairs({ "isVaulting", "isRepairing", "isHealing", "isUnhooking" }) do
+				pcall(function()
+					check:SetAttribute(attribute, false)
+				end)
+			end
+		end
+
+		pcall(function() character:SetAttribute("Trapped", false) end)
+		pcall(function() character:SetAttribute("IsCarried", false) end)
+		pcall(function() character:SetAttribute("IsHooked", false) end)
+		pcall(function() localPlayer:SetAttribute("IsDead", false) end)
+	end
+
+	-- The parry button, found in whichever Survivor GUI folder exists.
+	local function findParryButtonLive()
+		local playerGui = localPlayer:FindFirstChild("PlayerGui")
+		if not playerGui then
+			return nil
+		end
+
+		for _, folderName in ipairs({ "Survivor-mob", "Survivor-con", "Survivor" }) do
+			local folder = playerGui:FindFirstChild(folderName)
+			local controls = folder and folder:FindFirstChild("Controls")
+			local button = controls and controls:FindFirstChild("Gui-mob")
+			if button then
+				return button
+			end
+		end
+
+		return nil
+	end
+
+	local function getParryButton()
+		local playerGui = localPlayer:FindFirstChild("PlayerGui")
+		if cachedButton and cachedButton.Parent and playerGui and cachedButton:IsDescendantOf(playerGui) then
+			return cachedButton
+		end
+
+		cachedButton = findParryButtonLive()
+		return cachedButton
+	end
+
+	task.spawn(function()
+		while gui.Parent do
+			task.wait(1)
+			local liveButton = findParryButtonLive()
+			if liveButton then
+				cachedButton = liveButton
+			end
+		end
+	end)
+
+	-- Get the controller behind a button's handler and call a method on it.
+	local function findControllerInHandler(signal, matches)
+		local okConnections, connectionList = pcall(getconnections, signal)
+		if not okConnections or not connectionList then
+			return nil
+		end
+
+		for _, connection in ipairs(connectionList) do
+			if connection.Enabled ~= false then
+				local ok, upvalues = pcall(getupvalues, connection.Function)
+				if ok and upvalues then
+					for _, upvalue in ipairs(upvalues) do
+						if type(upvalue) == "table" and matches(upvalue) then
+							return upvalue
+						end
+					end
+				end
+			end
+		end
+
+		return nil
+	end
+
+	local function triggerParry()
+		if tick() < serverCooldownEnd then
+			return false
+		end
+
+		if tick() - lastTriggerAt < 0.08 then
+			return false
+		end
+		lastTriggerAt = tick()
+
+		local button = getParryButton()
+		if not button then
+			return false
+		end
+
+		bypassAllStates()
+
+		if not getconnections or not getupvalues then
+			return false
+		end
+
+		local instance = findControllerInHandler(button.MouseButton1Down, function(candidate)
+			local metatable = getmetatable(candidate)
+			return metatable and metatable.__index and type(candidate.Parry) == "function"
+		end)
+		if not instance then
+			return false
+		end
+
+		-- CanUse covers equip, cooldown, busy and health checks.
+		local okCan, canUse = pcall(instance.CanUse, instance)
+		if not okCan or not canUse then
+			return false
+		end
+
+		return (pcall(function()
+			instance.Parry(instance)
+		end))
+	end
+
+	-- Press the crouch button the same way the game does.
+	local function triggerCrouch()
+		local playerGui = localPlayer:FindFirstChild("PlayerGui")
+		local folder = playerGui and playerGui:FindFirstChild("Survivor-mob")
+		local controls = folder and folder:FindFirstChild("Controls")
+		local button = controls and controls:FindFirstChild("crouch")
+
+		if not button or not getconnections or not getupvalues then
+			return
+		end
+
+		local instance = findControllerInHandler(button.MouseButton1Click, function(candidate)
+			return type(candidate._setCrouching) == "function"
+		end)
+		if not instance then
+			return
+		end
+
+		pcall(function()
+			if instance.isCtrlHeld or (instance.humanoid.Health <= 59 or (not instance:_isGrounded() or (instance:_getActiveAction() or instance.character:GetAttribute("Rooted")))) then
+				-- Stand up.
+				instance.isCtrlHeld = false
+				instance.character:SetAttribute("Crouching", false)
+				instance.changeatt:FireServer("Crouchingserver", false)
+				if instance._checkConditions then instance:_checkConditions() end
+				instance.humanoid:ChangeState(Enum.HumanoidStateType.Landed)
+				if instance._refreshMobileButtons then instance:_refreshMobileButtons() end
+			else
+				-- Crouch.
+				instance.isCtrlHeld = true
+				instance.isShiftHeld = false
+				if instance._syncSprint then instance:_syncSprint() end
+				instance.character:SetAttribute("Crouching", true)
+				instance.changeatt:FireServer("Crouchingserver", true)
+				instance.runevent:FireServer(instance.character, false)
+				if instance._checkConditions then instance:_checkConditions() end
+				instance.humanoid:ChangeState(Enum.HumanoidStateType.Landed)
+				if instance._refreshMobileButtons then instance:_refreshMobileButtons() end
+			end
+		end)
+	end
+
+	-- Killer tracking.
+	local function unhookKiller()
+		if killerHookConnection then
+			pcall(function()
+				killerHookConnection:Disconnect()
+			end)
+		end
+
+		killerHookConnection, currentKiller, hookedAnimator = nil, nil, nil
+		activeTrackerToken += 1
+	end
+
+	local function findLiveKiller()
+		for _, player in ipairs(playersService:GetPlayers()) do
+			if player ~= localPlayer then
+				local character = player.Character
+				if character and character.Parent and character:FindFirstChild("Lookscriptkiller", true) then
+					return character
+				end
+			end
+		end
+
+		return nil
+	end
+
+	-- Line of sight filters.
+	local function nameIsNonWall(name)
+		return name ~= nil and NON_WALL_NAMES[string.lower(name)] == true
+	end
+
+	local function hasHumanoidAncestor(instance)
+		local model = instance:FindFirstAncestorOfClass("Model")
+		while model do
+			if model:FindFirstChildOfClass("Humanoid") then
+				return true
+			end
+
+			model = model:FindFirstAncestorOfClass("Model")
+			if model and model.Parent == workspace then
+				break
+			end
+		end
+
+		return false
+	end
+
+	local function isNonWallHit(instance, killerCharacter)
+		if not instance then
+			return true
+		end
+
+		if killerCharacter and instance:IsDescendantOf(killerCharacter) then
+			return true
+		end
+
+		for _, player in ipairs(playersService:GetPlayers()) do
+			local character = player.Character
+			if character and instance:IsDescendantOf(character) then
+				return true
+			end
+		end
+
+		if hasHumanoidAncestor(instance) or nameIsNonWall(instance.Name) then
+			return true
+		end
+
+		local ancestor = instance.Parent
+		while ancestor and ancestor ~= workspace do
+			if nameIsNonWall(ancestor.Name) then
+				return true
+			end
+			ancestor = ancestor.Parent
+		end
+
+		return false
+	end
+
+	local function buildRayFilter(myCharacter, killerCharacter)
+		local list = {}
+
+		for _, player in ipairs(playersService:GetPlayers()) do
+			if player.Character then
+				table.insert(list, player.Character)
+			end
+		end
+
+		if myCharacter then
+			table.insert(list, myCharacter)
+		end
+		if killerCharacter then
+			table.insert(list, killerCharacter)
+		end
+
+		for _, name in ipairs({ "Hitboxes", "Hitbox", "VFX", "Vfx", "Effects", "FX" }) do
+			local folder = workspace:FindFirstChild(name)
+			if folder then
+				table.insert(list, folder)
+			end
+		end
+
+		return list
+	end
+
+	-- Watch the killer for 0.55 seconds and parry once the lunge can reach you.
+	local function trackLungeWindow(killerCharacter, token)
+		local startTime = tick()
+
+		while tick() - startTime < 0.55 do
+			if activeTrackerToken ~= token or not killerCharacter or not killerCharacter.Parent then
+				return
+			end
+
+			local myCharacter = localPlayer.Character
+			if not myCharacter then
+				return
+			end
+
+			local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
+			local myRoot = myCharacter:FindFirstChild("HumanoidRootPart")
+			local myHumanoid = myCharacter:FindFirstChildOfClass("Humanoid")
+			if not killerRoot or not myRoot or not myHumanoid then
+				return
+			end
+
+			local delta = myRoot.Position - killerRoot.Position
+
+			if delta.Magnitude <= flags["Survivor.Parry Radius"] then
+				local facing = killerRoot.CFrame.LookVector:Dot(delta.Unit)
+
+				if facing >= flags["Survivor.Facing Dot"] then
+					local params = RaycastParams.new()
+					params.FilterType = Enum.RaycastFilterType.Exclude
+					params.FilterDescendantsInstances = buildRayFilter(myCharacter, killerCharacter)
+
+					local wallHit = workspace:Raycast(myRoot.Position, killerRoot.Position - myRoot.Position, params)
+					local isWall = wallHit and wallHit.Instance and not isNonWallHit(wallHit.Instance, killerCharacter)
+
+					if not isWall then
+						triggerParry()
+						return
+					end
+				end
+			end
+
+			task.wait(0.02)
+		end
+	end
+
+	local function handleAnim(track)
+		if not flags["Survivor.Auto Parry"] then
+			return
+		end
+
+		local animation = track.Animation
+		if not animation then
+			return
+		end
+
+		local id = string.match(animation.AnimationId or "", "%d+")
+		if not id then
+			return
+		end
+
+		local killerCharacter = currentKiller
+		if not killerCharacter or not killerCharacter.Parent then
+			return
+		end
+
+		local myCharacter = localPlayer.Character
+		if not myCharacter then
+			return
+		end
+
+		local myRoot = myCharacter:FindFirstChild("HumanoidRootPart")
+		local killerRoot = killerCharacter:FindFirstChild("HumanoidRootPart")
+		if not myRoot or not killerRoot then
+			return
+		end
+
+		local distance = (myRoot.Position - killerRoot.Position).Magnitude
+
+		-- Abysswalker Slash: crouch, then stand up after 3.05 seconds. Never parried.
+		if id == ABYSS_SLASH_ID then
+			if flags["Survivor.Abyss Auto Crouch"] and distance <= 30 and not isCrouchSequenceActive then
+				isCrouchSequenceActive = true
+				triggerCrouch()
+
+				task.delay(3.05, function()
+					triggerCrouch()
+					isCrouchSequenceActive = false
+				end)
+			end
+			return
+		end
+
+		if not LUNGE_IDS[id] then
+			return
+		end
+
+		-- Already in range and facing you: parry right away.
+		if distance <= flags["Survivor.Parry Radius"] then
+			local delta = myRoot.Position - killerRoot.Position
+			if killerRoot.CFrame.LookVector:Dot(delta.Unit) >= flags["Survivor.Facing Dot"] then
+				triggerParry()
+				return
+			end
+		end
+
+		activeTrackerToken += 1
+		local token = activeTrackerToken
+
+		task.spawn(function()
+			trackLungeWindow(killerCharacter, token)
+		end)
+	end
+
+	local function tryHook(killerCharacter)
+		if not killerCharacter or not killerCharacter.Parent then
+			return
+		end
+
+		local humanoid = killerCharacter:FindFirstChildOfClass("Humanoid")
+		if not humanoid then
+			return
+		end
+
+		local animator = humanoid:FindFirstChildOfClass("Animator")
+			or killerCharacter:FindFirstChildOfClass("Animator")
+			or killerCharacter:FindFirstChild("Animator", true)
+		if not animator then
+			return
+		end
+
+		if hookedAnimator == animator and killerHookConnection then
+			return
+		end
+
+		if killerHookConnection then
+			pcall(function()
+				killerHookConnection:Disconnect()
+			end)
+		end
+
+		hookedAnimator = animator
+		killerHookConnection = animator.AnimationPlayed:Connect(function(track)
+			pcall(handleAnim, track)
+		end)
+
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			task.spawn(function()
+				pcall(handleAnim, track)
+			end)
+		end
+	end
+
+	-- Find the killer and hook its animator. Idle while Auto Parry is off.
+	task.spawn(function()
+		while gui.Parent do
+			if not flags["Survivor.Auto Parry"] then
+				if currentKiller then
+					unhookKiller()
+				end
+				task.wait(0.2)
+			else
+				task.wait(0.016)
+
+				local killerCharacter = findLiveKiller()
+				if killerCharacter then
+					if currentKiller ~= killerCharacter then
+						unhookKiller()
+						currentKiller = killerCharacter
+					end
+
+					if not killerHookConnection then
+						tryHook(killerCharacter)
+					end
+				elseif currentKiller then
+					unhookKiller()
+				end
+			end
+		end
+	end)
+
+	-- Reset on every respawn, then re-equip the dagger so its button reconnects.
+	local function resetMatchState()
+		cachedButton = nil
+		lastTriggerAt = 0
+
+		if killerHookConnection then
+			pcall(function()
+				killerHookConnection:Disconnect()
+			end)
+		end
+
+		killerHookConnection, hookedAnimator, currentKiller = nil, nil, nil
+		activeTrackerToken += 1
+		serverCooldownEnd = 0
+		isCrouchSequenceActive = false
+	end
+
+	local function refreshGameState()
+		task.spawn(function()
+			task.wait(1.5)
+			if not findParryButtonLive() then
+				return
+			end
+
+			local character = localPlayer.Character
+			if not character then
+				return
+			end
+
+			local backpack = localPlayer:FindFirstChild("Backpack")
+			local dagger = character:FindFirstChild("Parrying Dagger") or (backpack and backpack:FindFirstChild("Parrying Dagger"))
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			if not dagger or not humanoid then
+				return
+			end
+
+			if dagger.Parent == character then
+				humanoid:UnequipTools()
+				task.wait(0.3)
+			end
+
+			humanoid:EquipTool(dagger)
+			task.wait(0.3)
+
+			local oldSpeed = humanoid.WalkSpeed
+			humanoid.WalkSpeed = oldSpeed + 0.01
+			task.wait(0.1)
+			humanoid.WalkSpeed = oldSpeed
+		end)
+	end
+
+	table.insert(connections, localPlayer.CharacterAdded:Connect(function()
+		resetMatchState()
+		refreshGameState()
+	end))
+
+	table.insert(connections, localPlayer.CharacterRemoving:Connect(function()
+		cachedButton = nil
+	end))
+
+	-- Visual ring on the floor showing the parry radius.
+	local function ensureRing()
+		if ringPart and ringPart.Parent then
+			return
+		end
+
+		ringPart = create("Part", {
+			Name = RING_NAME,
+			Anchored = true,
+			CanCollide = false,
+			CanQuery = false,
+			CanTouch = false,
+			CastShadow = false,
+			Material = Enum.Material.SmoothPlastic,
+			Transparency = 1,
+			Size = Vector3.new(2, 0.05, 2),
+		}, workspace)
+
+		ringGui = create("SurfaceGui", {
+			Name = "RingUI",
+			Face = Enum.NormalId.Top,
+			AlwaysOnTop = true,
+			LightInfluence = 0,
+			SizingMode = Enum.SurfaceGuiSizingMode.FixedSize,
+			CanvasSize = Vector2.new(1024, 1024),
+		}, ringPart)
+
+		local ringFrame = create("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+		}, ringGui)
+		round(ringFrame, 1024)
+
+		create("UIStroke", {
+			Color = Color3.new(1, 1, 1),
+			Thickness = 3,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, ringFrame)
+	end
+
+	table.insert(connections, runService.RenderStepped:Connect(function()
+		if not flags["Survivor.Visual Radius"] then
+			if ringGui then
+				ringGui.Enabled = false
+			end
+			return
+		end
+
+		ensureRing()
+
+		local character = localPlayer.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not root then
+			ringGui.Enabled = false
+			return
+		end
+
+		ringGui.Enabled = true
+
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { character, ringPart }
+
+		local position = root.Position
+		local hit = workspace:Raycast(position, Vector3.new(0, -50, 0), params)
+		local groundY = (hit and hit.Position.Y or (position.Y - 3)) - 0.1
+		local radius = math.max(math.min(flags["Survivor.Parry Radius"], MAX_VISUAL_RADIUS), 0.5)
+
+		ringPart.Size = Vector3.new(radius * 2, 0.05, radius * 2)
+		ringPart.CFrame = CFrame.new(position.X, groundY, position.Z)
+	end))
+
+	-- Clean up the ring and killer hook when the hub closes.
+	local baseDestroy = Hub.destroy
+
+	function Hub.destroy()
+		unhookKiller()
+		if ringPart then
+			pcall(function()
+				ringPart:Destroy()
+			end)
+		end
+
+		baseDestroy()
+	end
+end
+
+setupAutoParry()
 
 -- YOUR OWN FEATURES: add Hub.on("Tab.Row text", function(value) ... end) calls here.
 
